@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -265,9 +266,30 @@ func taskkillServiceTree(pid uint32, force bool) error {
 		if force {
 			forceArg = " /F"
 		}
-		return fmt.Errorf("taskkill /PID %d /T%s: %v: %s", pid, forceArg, err, strings.TrimSpace(string(out)))
+		msg := strings.TrimSpace(string(out))
+		hint := ""
+		lower := strings.ToLower(msg)
+		if strings.Contains(msg, "拒绝访问") || strings.Contains(lower, "access is denied") ||
+			strings.Contains(msg, "拒绝存取") || strings.Contains(msg, "拒绝") {
+			hint = "（权限不足：面板拿不到终止该进程的权限。常见原因：面板以普通权限运行而业务进程以管理员运行、" +
+				"面板本身运行在受限沙箱/容器中、业务进程属于其他用户或会话。请以相同或更高权限运行面板，" +
+				"或先在任务管理器里手工结束该进程）"
+		}
+		return fmt.Errorf("taskkill /PID %d /T%s: %v: %s%s", pid, forceArg, err, msg, hint)
 	}
 	return nil
+}
+
+// terminateProcessDirect 只对单个 pid 调 TerminateProcess，不做 /T 树遍历。
+// /T 会遍历整棵树，任何一个子进程拒绝访问都会让 taskkill 整条命令失败（exit 255），
+// 但根进程往往仍然可杀，这时直接终止根进程是唯一还能救回来的退路。
+func terminateProcessDirect(pid uint32) error {
+	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.SYNCHRONIZE, false, pid)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	return windows.TerminateProcess(h, 1)
 }
 
 func waitProcessGone(pid uint32, timeout time.Duration) bool {
@@ -281,7 +303,8 @@ func waitProcessGone(pid uint32, timeout time.Duration) bool {
 	return !processAlive(pid)
 }
 
-// terminateGracefully 先 taskkill /PID /T（不带 /F），超过 grace 再 /F。
+// terminateGracefully 先 taskkill /PID /T（不带 /F），超过 grace 再 /F；
+// 如果整树命令失败（典型：某个子进程拒绝访问）或根进程还活着，再直接对根进程补一刀。
 func terminateGracefully(pid uint32, grace time.Duration) error {
 	if !processAlive(pid) {
 		return nil
@@ -290,16 +313,28 @@ func terminateGracefully(pid uint32, grace time.Duration) error {
 	if waitProcessGone(pid, grace) {
 		return nil
 	}
-	if err := taskkillServiceTree(pid, true); err != nil {
+	treeErr := taskkillServiceTree(pid, true)
+	if waitProcessGone(pid, 3*time.Second) {
+		// /T 报错但根进程已经退出：按成功处理，残留子进程由调用方/日志感知。
+		if treeErr != nil {
+			log.Printf("[panel] taskkill 整树失败但根进程 %d 已退出: %v", pid, treeErr)
+		}
+		return nil
+	}
+
+	// 树杀之后进程还在：直接终止根进程，绕过 /T 的整树遍历。
+	if derr := terminateProcessDirect(pid); derr == nil {
 		if waitProcessGone(pid, 3*time.Second) {
+			if treeErr != nil {
+				log.Printf("[panel] taskkill 整树失败（%v），已改为直接终止根进程 %d；可能有子进程残留", treeErr, pid)
+			}
 			return nil
 		}
-		return err
 	}
-	if !waitProcessGone(pid, 3*time.Second) {
-		return fmt.Errorf("pid %d 在强制结束后仍未退出", pid)
+	if treeErr != nil {
+		return treeErr // 已带“权限不足”提示
 	}
-	return nil
+	return fmt.Errorf("pid %d 在强制结束（taskkill /T /F + TerminateProcess）后仍未退出", pid)
 }
 
 // portInUse 只用于本机端口。先尝试连接 loopback（最可靠地发现“已有监听者”），

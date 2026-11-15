@@ -240,6 +240,7 @@
     .card[data-state="circuit"] { border-color: #fde68a; background: linear-gradient(180deg, #fff 40%, #fffdf5); --tone: var(--amber); }
     .card[data-state="up"] { --tone: var(--green-strong); }
     .card[data-state="starting"] { --tone: var(--primary); }
+    .card[data-state="stopping"] { --tone: var(--amber); }
     .card[data-state="stopped"], .card[data-state="disabled"], .card[data-state="unknown"] { --tone: var(--gray); }
     .card-top { display: flex; align-items: center; gap: 8px; }
     .status-pill {
@@ -254,6 +255,7 @@
     .status-pill.down { background: var(--red-weak); color: var(--red); border-color: #fecaca; }
     .status-pill.circuit { background: var(--amber-weak); color: var(--amber); border-color: #fde68a; }
     .status-pill.starting { background: var(--primary-weak); color: var(--primary); border-color: #bfdbfe; }
+    .status-pill.stopping { background: var(--amber-weak); color: var(--amber); border-color: #fde68a; }
     .status-pill.stopped, .status-pill.disabled, .status-pill.unknown { background: var(--gray-weak); color: #64748b; border-color: #e2e8f0; }
     .status-pill.up .dot { animation: breathedot 2.4s ease-in-out infinite; }
     @keyframes breathedot { 0%, 100% { box-shadow: 0 0 0 0 rgba(22, 163, 74, .35); } 50% { box-shadow: 0 0 0 4px rgba(22, 163, 74, 0); } }
@@ -1085,6 +1087,7 @@
       down:      { label: "DOWN",   tone: "down",      weight: 0 },
       circuit:   { label: "熔断",   tone: "circuit",   weight: 1 },
       starting:  { label: "启动中", tone: "starting",  weight: 2 },
+      stopping:  { label: "停止中", tone: "stopping",  weight: 2.5 },
       stopped:   { label: "已停止", tone: "stopped",   weight: 5 },
       disabled:  { label: "已禁用", tone: "disabled",  weight: 6 },
       unknown:   { label: "待检查", tone: "unknown",   weight: 3 },
@@ -1457,8 +1460,8 @@
 
       r.start.disabled = !!item.running || item.state === "up";
       r.start.title = r.start.disabled ? "服务已在运行" : "启动服务";
-      r.stop.disabled = !item.running;
-      r.stop.title = item.running ? "停止该服务自己的进程树" : "面板未托管该服务的 pid";
+      r.stop.disabled = !item.running || item.state === "stopping";
+      r.stop.title = item.state === "stopping" ? "正在停止（等待进程退出）" : (item.running ? "停止该服务自己的进程树" : "面板未托管该服务的 pid");
       r.restart.disabled = !item.pid && !!item.up;
       r.restart.title = r.restart.disabled ? "探针 UP 但面板未托管 pid，无法重启" : "停止并重新启动";
       r.logs.disabled = false;

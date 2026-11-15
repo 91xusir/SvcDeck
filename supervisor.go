@@ -52,6 +52,7 @@ type svcRT struct {
 	graceUntil time.Time
 
 	probing         atomic.Bool
+	stopping        atomic.Bool // Stop 正在执行（taskkill + 宽限等待），仅内存态，不落库
 	removed         atomic.Bool
 	circuitNotified bool
 }
@@ -321,7 +322,10 @@ func (s *Supervisor) AutoStart(id string) {
 		rt.mu.Unlock()
 		if err := s.ensureRunning(rt, "config"); err != nil {
 			log.Printf("[svc:%s] 启用后自动拉起失败: %v", id, err)
+			return
 		}
+		s.probeNow(rt)
+		s.followUpProbes(rt)
 	}()
 }
 
@@ -392,6 +396,56 @@ func (s *Supervisor) tick() {
 }
 
 const spawnGrace = 15 * time.Second
+
+// ---------------- 手动动作后的即时探针 ----------------
+
+// probeNow 立刻对单个服务跑一次探针，不等下一个 tick。
+// 用于手动 Start/Stop/Restart 之后：平时靠周期探针，但手动动作后等一个
+// probe_interval（默认 5s）才看到结果，UI 会白等 4~5 秒。
+//
+// 调用方不得持有 rt.opMu：探针结果可能触发 keepaliveRestart，而它会再取 opMu。
+// 与周期探针共用 rt.probing 这个 CAS 闸门，因此两者不会重叠执行。
+func (s *Supervisor) probeNow(rt *svcRT) {
+	if rt.removed.Load() || s.ctx.Err() != nil {
+		return
+	}
+	if !rt.probing.CompareAndSwap(false, true) {
+		return // 已有一次探针在跑，这次的“即时”请求直接让路
+	}
+	defer rt.probing.Store(false)
+
+	cfg, st, _, _, _ := s.snapshot(rt)
+	res := probeService(s.ctx, s.client, cfg, st, s.exeUnique(cfg.Exe))
+	s.applyProbe(rt, res)
+}
+
+// followUpProbes 在手动启动/重启后补几次快探针。
+// 典型业务服务几百毫秒到一两秒就开始监听，等一整轮 probe_interval 才首次探测
+// 会让看板白等；这里每 700ms 探一次，最多 6 次（约 4 秒），一旦 UP 就提前收工。
+func (s *Supervisor) followUpProbes(rt *svcRT) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for i := 0; i < 6; i++ {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-time.After(700 * time.Millisecond):
+			}
+			if rt.removed.Load() {
+				return
+			}
+			cfg, st, _, _, _ := s.snapshot(rt)
+			if st.LastUp || st.ManualStop || st.CircuitOpen {
+				return // 已经 UP，或用户又改成“手工停止/熔断”，不必再快探
+			}
+			if !cfg.Enabled {
+				return
+			}
+			s.probeNow(rt)
+		}
+	}()
+}
 
 func (s *Supervisor) applyProbe(rt *svcRT, res ProbeResult) {
 	now := time.Now()
@@ -522,10 +576,14 @@ func (s *Supervisor) persistLocked(rt *svcRT) {
 	}
 }
 
-func (s *Supervisor) runtimeView(cfg Service, st RuntimeState, rtMs, lastCheck int64, grace time.Time, now time.Time) RuntimeView {
+func (s *Supervisor) runtimeView(cfg Service, st RuntimeState, rtMs, lastCheck int64, grace time.Time, now time.Time, stopping bool) RuntimeView {
 	graceActive := !grace.IsZero() && now.Before(grace)
 	state := "down"
 	switch {
+	case stopping:
+		// Stop 已经发起但进程还没走：此时 pid 和 last_up 都可能还是旧值，
+		// 必须优先显示「停止中」，否则 UI 会一直显示 UP 直到 taskkill 完成。
+		state = "stopping"
 	case st.LastUp:
 		state = "up"
 	case !cfg.Enabled:
@@ -564,7 +622,7 @@ func (s *Supervisor) viewFor(rt *svcRT) ServiceView {
 	cfg, st, rtMs, lastCheck, grace := s.snapshot(rt)
 	return ServiceView{
 		Service: cfg,
-		Runtime: s.runtimeView(cfg, st, rtMs, lastCheck, grace, time.Now()),
+		Runtime: s.runtimeView(cfg, st, rtMs, lastCheck, grace, time.Now(), rt.stopping.Load()),
 	}
 }
 
@@ -849,6 +907,8 @@ func (s *Supervisor) clearPortResidual(rt *svcRT, cfg Service, st RuntimeState, 
 }
 
 func (s *Supervisor) stopLocked(rt *svcRT, markManual bool) error {
+	rt.stopping.Store(true)
+	defer rt.stopping.Store(false)
 	cfg, st, _, _, _ := s.snapshot(rt)
 	grace := time.Duration(s.cfgStore.Get().StopGraceSec) * time.Second
 	if grace <= 0 {
@@ -879,6 +939,7 @@ func (s *Supervisor) stopLocked(rt *svcRT, markManual bool) error {
 		// 只杀这个服务自己的树：taskkill /PID <pid> /T；先不带 /F，超时再 /F。
 		stopErr = terminateGracefully(pid, grace)
 		if stopErr != nil {
+			log.Printf("[svc:%s] 停止失败（pid %d）: %v", cfg.ID, pid, stopErr)
 			rt.mu.Lock()
 			rt.st.LastError = stopErr.Error()
 			s.persistLocked(rt)
@@ -994,7 +1055,6 @@ func (s *Supervisor) StartService(id string) error {
 		return fmt.Errorf("服务不存在: %s", id)
 	}
 	rt.opMu.Lock()
-	defer rt.opMu.Unlock()
 	rt.mu.Lock()
 	rt.st.ManualStop = false
 	rt.st.CircuitOpen = false
@@ -1005,7 +1065,15 @@ func (s *Supervisor) StartService(id string) error {
 	rt.circuitNotified = false
 	s.persistLocked(rt)
 	rt.mu.Unlock()
-	return s.ensureRunningLocked(rt, "manual-start")
+	err := s.ensureRunningLocked(rt, "manual-start")
+	rt.opMu.Unlock()
+	if err != nil {
+		return err
+	}
+	// 先解锁再探针：探针结果可能触发 keepaliveRestart，而它会再取 opMu。
+	s.probeNow(rt)
+	s.followUpProbes(rt)
+	return nil
 }
 
 func (s *Supervisor) StopService(id string) error {
@@ -1014,8 +1082,13 @@ func (s *Supervisor) StopService(id string) error {
 		return fmt.Errorf("服务不存在: %s", id)
 	}
 	rt.opMu.Lock()
-	defer rt.opMu.Unlock()
-	return s.stopLocked(rt, true)
+	err := s.stopLocked(rt, true)
+	rt.opMu.Unlock()
+	if err == nil {
+		// 立刻补一次探针，让 last_check 与状态同步到“已停止”，不用等下一轮 tick。
+		s.probeNow(rt)
+	}
+	return err
 }
 
 func (s *Supervisor) RestartService(id string) error {
@@ -1024,7 +1097,6 @@ func (s *Supervisor) RestartService(id string) error {
 		return fmt.Errorf("服务不存在: %s", id)
 	}
 	rt.opMu.Lock()
-	defer rt.opMu.Unlock()
 	rt.mu.Lock()
 	rt.st.ManualStop = false
 	rt.st.CircuitOpen = false
@@ -1037,9 +1109,11 @@ func (s *Supervisor) RestartService(id string) error {
 	rt.mu.Unlock()
 
 	if err := s.stopForRestartLocked(rt); err != nil {
+		rt.opMu.Unlock()
 		return err
 	}
 	if err := s.spawnLocked(rt, "manual-restart"); err != nil {
+		rt.opMu.Unlock()
 		return err
 	}
 	rt.mu.Lock()
@@ -1047,6 +1121,10 @@ func (s *Supervisor) RestartService(id string) error {
 	rt.st.NextRetryAt = 0
 	s.persistLocked(rt)
 	rt.mu.Unlock()
+	rt.opMu.Unlock()
+
+	s.probeNow(rt)
+	s.followUpProbes(rt)
 	return nil
 }
 
@@ -1091,7 +1169,10 @@ func (s *Supervisor) RestartAll() ([]string, []string) {
 		}
 		if err := s.ensureRunning(rt, "restart-all"); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", id, err))
+			continue
 		}
+		s.probeNow(rt)
+		s.followUpProbes(rt)
 	}
 	return order, errs
 }

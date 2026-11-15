@@ -61,6 +61,10 @@ SvcDeck 是一个**单二进制**的 Windows 本地服务面板，用来管理�
   - 端口残留清理
   - 熔断（持久化）与可选 Webhook
   - 手动 Stop 会抑制保活，直到手动 Start / Restart
+- **AI 接入（MCP）**
+  - 同一个 `SvcDeck.exe` 内置 `POST /mcp`（Streamable HTTP），不需要额外 exe 或额外进程
+  - 可选 `SvcDeck.exe -mcp` stdio 模式，兼容只支持 stdio 的 MCP 客户端（仍是同一个 exe）
+  - 支持列出、查看、新增、局部更新、启动、停止、重启、删除、日志、探测历史、全部重启
 
 ---
 
@@ -77,6 +81,7 @@ SvcDeck/
 ├── config.go               # 全局 Settings 与热加载 ConfigStore
 ├── process_windows.go      # Detached spawn、PID 校验、taskkill、端口检查（Windows）
 ├── singleton_windows.go    # 命名 Mutex 单例（Windows）
+├── mcpserver/              # 内置 MCP（Streamable HTTP + 可选 stdio）
 ├── web/
 │   └── index.html          # 单页前端（原生 JS + fetch，无构建工具）
 ├── go.mod / go.sum
@@ -116,6 +121,8 @@ go build -trimpath -ldflags "-s -w -H windowsgui" -o SvcDeck.exe .
 ```
 
 两条命令都验证过可构建。仅第二条带 `-H windowsgui`，它是「双击是否弹黑窗口」以及「面板日志写哪里」的分水岭。
+
+MCP 已经编进 `SvcDeck.exe`：HTTP 端点随面板启动，不需要再编译第二个 exe；`-mcp` 只是同一个 exe 的 stdio 运行模式（见 §6.3）。
 
 ### 3.3 运行
 
@@ -297,10 +304,13 @@ spawn 前，如果探针目标端口是本机端口且已被占用：
   1. 校验 pid 归属；
   2. 先 `taskkill /PID <pid> /T`（不带 `/F`）；
   3. 超过 `stop_grace_sec` 仍存活再 `/F`；
-  4. 清空 `runtime_state.pid`，写 `manual_stop=1`。
+  4. 整树命令失败或根进程仍存活时，直接 `TerminateProcess` 根进程（`/T` 遇到拒绝访问的子进程会让整条命令失败，这一步能救回根进程，但可能有子进程残留，记日志）；
+  5. 清空 `runtime_state.pid`，写 `manual_stop=1`。
+- 停止进行中状态为「停止中」（灰色/黄色 pill，仅内存态，不落库），进程退出后立刻转「已停止」；Stop 返回时会立即补一次探针，不必等下一个 `probe_interval`。
 - `manual_stop=1` 后，探针仍会继续展示，但**不会**被保活自动拉起；面板重启也不会自动启动它；
 - 只有 `POST /api/start/{id}`、`POST /api/restart/{id}`、`POST /api/restart-all`（enabled 服务）会清除该标记；
 - 例外：通过 `PUT /api/services/{id}` 把 `enabled` 从 `false` 改为 `true` 也是一次明确的“启用”操作，会清除 `manual_stop` / 熔断并异步拉起（新增 `enabled=true` 的服务同理）。
+- 手动 Start / Restart / 启用后会自动**立刻探一次**，并在随后约 4 秒内每 700ms 补探一次，直到 UP；业务服务通常几百毫秒就监听，不必等一整轮 `probe_interval`。
 
 ### 5.6 服务粒度 taskkill
 
@@ -312,6 +322,12 @@ spawn 前，如果探针目标端口是本机端口且已被占用：
 | 保活重启 | 同上，先停旧进程树，再 spawn |
 
 命令只针对该服务自己的 `pid` 及其子树（`/T`），不涉及其他服务，也不涉及面板。
+
+失败与兜底：
+
+- `taskkill /T` 会遍历整棵树，**任何一个子进程拒绝访问都会让整条命令 exit 255**，即使根进程已退出；因此代码先看根进程是否还在，不在就按成功处理；
+- 根进程仍存活时，面板会对**根进程**直接调用 `TerminateProcess`（不遍历子树），这样能绕开“某个子进程杀不掉”的死局，代价是该子进程可能残留，日志会记 `taskkill 整树失败（...），已改为直接终止根进程`；
+- 两条路都失败（典型是面板权限低于业务进程）时，服务保持原状态、`last_error` 记录原因、面板日志打印 `[svc:%s] 停止失败（pid N）`，**不会误杀其它进程**。
 
 ---
 
@@ -349,6 +365,8 @@ Authorization: Bearer <token>
 | GET | `/api/config` | 全局设置 |
 | PUT | `/api/config` | 保存并热加载；`listen_addr` 变更返回 `restart_required` |
 
+> MCP 端点不走 `/api` 前缀：`POST /mcp`（Streamable HTTP，详见 §6.3）。
+
 ### 6.1 新增服务示例（PowerShell）
 
 ```powershell
@@ -372,6 +390,78 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8088/api/services `
 - 成功：`{"ok":true,...}`，列表为 `{"items":[...]}`；
 - 失败：`{"error":"..."}`，HTTP 400 / 401 / 404 / 409 / 500；
 - 所有写操作都校验输入；exe 必须存在且不是目录；依赖必须存在且不能成环。
+
+### 6.3 MCP Server（同一个 SvcDeck.exe，内置 HTTP）
+
+不需要 `svcdeck-mcp.exe`。MCP 直接挂在面板的 HTTP 服务上，随面板进程一起启动：
+
+```text
+POST http://127.0.0.1:8088/mcp
+```
+
+采用 **Streamable HTTP**：
+
+- 客户端 POST JSON-RPC（`initialize` / `tools/list` / `tools/call`）；
+- notification（如 `notifications/initialized`）返回 `202 Accepted`；
+- `GET` / `DELETE` 返回 `405`（当前不主动推送服务端消息）；
+- 不读写 SQLite，只调用面板 REST API，因此不会绕过校验、热加载、adopt 与探测循环。
+
+MCP 客户端配置：
+
+| 项 | 值 |
+| --- | --- |
+| URL | `http://127.0.0.1:8088/mcp` |
+| Transport | `streamable-http` |
+| Header | 面板设置 token 时：`X-Panel-Token: <token>` 或 `Authorization: Bearer <token>` |
+
+DeepSeek Harness：MCP 连接器选 `streamable-http`，URL 填 `http://127.0.0.1:8088/mcp`；如果面板设置了 token，在 headers 里加 `X-Panel-Token`。
+
+如果客户端只支持 stdio，用同一个 exe 的 `-mcp` 模式即可，不会产生第二个文件：
+
+```powershell
+.\SvcDeck.exe -mcp
+```
+
+stdio 模式读取环境变量 `SVCDECK_URL`（默认 `http://127.0.0.1:8088`）、`SVCDECK_TOKEN`、`SVCDECK_TIMEOUT_SEC`，也支持 `-url` / `-token` 覆盖。它同样只是连接正在运行的面板，不抢面板单例。
+
+工具：
+
+| 工具 | 作用 | 破坏性 |
+| --- | --- | --- |
+| `list_services` | 列出服务摘要 | 否 |
+| `get_service` | 读取单个服务完整配置/运行态 | 否 |
+| `get_status` | 探针看板全量状态 | 否 |
+| `add_service` | 新增服务；`enabled=false` 只登记 | 否 |
+| `update_service` | 局部更新：先 GET 再合并 PUT | 否 |
+| `start_service` | 手动启动 | 否 |
+| `stop_service` | 停止该服务进程树 | 是 |
+| `restart_service` | 先停后起 | 是 |
+| `delete_service` | 删除配置，`stop=true` 先停 | 是 |
+| `get_logs` | 日志尾部 | 否 |
+| `get_history` | 探测历史 | 否 |
+| `restart_all` | 全部重启 | 是 |
+
+新增示例（MCP 工具参数）：
+
+```json
+{
+  "name": "订单服务",
+  "exe": "D:\\Services\\order-api\\order-api.exe",
+  "args": ["--port=9001"],
+  "enabled": false,
+  "probe_type": "http",
+  "probe_url": "http://127.0.0.1:9001/health"
+}
+```
+
+`add_service` 返回创建后的完整服务对象；`update_service` 只改你传入的字段，未传字段保持不变，运行中的启动配置变化会返回 `pending_restart`。
+
+注意：
+
+- HTTP 端点复用面板 token 中间件；token 为空时建议只监听 `127.0.0.1`。
+- 面板运行中改 token 后，MCP 客户端也要带新 token；内部 API 调用会自动读取当前 token。
+- 破坏性工具（stop/restart/delete/restart-all）应由 AI 在得到用户明确确认后调用。
+- stdio 模式的 stdout 只输出 JSON-RPC，日志写 stderr；HTTP 模式不需要额外进程，也不会占用面板的标准输入输出。
 
 ---
 
@@ -634,6 +724,16 @@ A：停掉面板，直接修改 SQLite `settings` 表中 `token` 的值为空；
 
 **Q：能否管理需要管理员权限的服务？**  
 A：可以配置，但面板自身需以足够权限运行，否则 `OpenProcess` / `taskkill` 会失败。
+
+**Q：点 Stop 报 `taskkill /PID xxx /T /F: exit status 255 ... 拒绝访问`？**  
+A：面板拿不到目标进程的终止权限，进程还在跑、状态仍是 UP（`last_error` 会留下这条错误，面板日志有 `[svc:...] 停止失败`）。按顺序排查：
+
+1. **权限低于目标**：业务 exe 曾以管理员启动 → 结束该进程，或用管理员权限重启面板；
+2. **面板在受限环境**：被容器/沙箱/低完整性进程拉起时，连普通用户进程也可能杀不掉 → 改在登录会话里双击或任务计划启动；
+3. **属于其他用户/会话**：用相同账户启动面板；
+4. **两个面板实例抢管同一服务**：`Get-Process SvcDeck` 关掉多余实例。
+
+面板已有兜底：`/T` 因某个子进程拒绝访问整体失败时，会改为直接 `TerminateProcess` 根进程（见 §5.6），能救回大多数“根进程还活着”的情况；仍然失败就只报错、不误杀。必要时先在任务管理器里手工结束该进程，再点 Start。
 
 **Q：数据库能备份吗？**  
 A：停面板后复制 `panel.db`（以及 `-wal` / `-shm`）即可；运行中请使用 SQLite 在线备份，不要直接复制。
