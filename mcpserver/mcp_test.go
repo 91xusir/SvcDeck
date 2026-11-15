@@ -23,10 +23,27 @@ func writeTestJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// sendJSON 走与 HTTP handler 相同的入口，返回解析后的响应。
+func sendJSON(t *testing.T, s *Server, raw string) (*rpcResponse, bool) {
+	t.Helper()
+	out, ok, err := s.HandleJSON(context.Background(), []byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		return nil, false
+	}
+	var resp rpcResponse
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	return &resp, true
+}
+
 func TestInitializeAndNotifications(t *testing.T) {
 	s := &Server{}
 
-	resp, ok := s.handleLine([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`))
+	resp, ok := sendJSON(t, s, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`)
 	if !ok || resp.Error != nil {
 		t.Fatalf("initialize failed: %+v", resp)
 	}
@@ -34,14 +51,14 @@ func TestInitializeAndNotifications(t *testing.T) {
 		t.Fatalf("protocolVersion = %v", got)
 	}
 
-	if _, ok := s.handleLine([]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)); ok {
+	if _, ok := sendJSON(t, s, `{"jsonrpc":"2.0","method":"notifications/initialized"}`); ok {
 		t.Fatal("notification should not produce a response")
 	}
 }
 
 func TestToolsListContainsCoreTools(t *testing.T) {
 	s := &Server{}
-	resp, ok := s.handleLine([]byte(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`))
+	resp, ok := sendJSON(t, s, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
 	if !ok || resp.Error != nil {
 		t.Fatalf("tools/list failed: %+v", resp)
 	}

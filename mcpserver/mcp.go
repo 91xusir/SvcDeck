@@ -1,12 +1,10 @@
 package mcpserver
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"strings"
 	"time"
 )
@@ -16,7 +14,7 @@ const (
 	serverVersion = "0.1.0"
 )
 
-// Server 是传输无关的 MCP Server：stdio 和 HTTP 都调用同一套 HandleJSON。
+// Server 是 MCP 协议实现：HTTP handler 调用 HandleJSON 处理单条 JSON-RPC。
 type Server struct {
 	api *apiClient
 }
@@ -30,20 +28,10 @@ func New(cfg Config) (*Server, error) {
 	return &Server{api: api}, nil
 }
 
-// Run 启动 stdio MCP Server。in/out 由根包传入 os.Stdin/os.Stdout。
-// stdout 只输出 JSON-RPC；日志由调用方写 stderr。
-func Run(cfg Config, in io.Reader, out io.Writer) error {
-	s, err := New(cfg)
-	if err != nil {
-		return err
-	}
-	return s.run(in, out)
-}
-
 // HandleJSON 处理一条 JSON-RPC 消息，返回可直接写回客户端的 JSON。
 // ok=false 表示这是 notification，不需要响应。
 func (s *Server) HandleJSON(ctx context.Context, raw []byte) (json.RawMessage, bool, error) {
-	resp, ok := s.handleLineContext(ctx, raw)
+	resp, ok := s.handleMessage(ctx, raw)
 	if !ok {
 		return nil, false, nil
 	}
@@ -76,34 +64,7 @@ type rpcResponse struct {
 	Error   *rpcError       `json:"error,omitempty"`
 }
 
-func (s *Server) run(r io.Reader, w io.Writer) error {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
-		resp, ok, err := s.HandleJSON(context.Background(), []byte(line))
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if _, err := w.Write(append(resp, '\n')); err != nil {
-			return err
-		}
-	}
-	return sc.Err()
-}
-
-func (s *Server) handleLine(line []byte) (*rpcResponse, bool) {
-	return s.handleLineContext(context.Background(), line)
-}
-
-func (s *Server) handleLineContext(ctx context.Context, line []byte) (*rpcResponse, bool) {
+func (s *Server) handleMessage(ctx context.Context, line []byte) (*rpcResponse, bool) {
 	var req rpcRequest
 	if err := json.Unmarshal(line, &req); err != nil {
 		return &rpcResponse{

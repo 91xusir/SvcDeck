@@ -8,47 +8,21 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"strconv"
 	"strings"
 	"time"
 )
 
 const defaultAPIURL = "http://127.0.0.1:8088"
 
-// Config 是 MCP 模式连接面板所需的配置。
-// MCP 模式不读写 SQLite，只通过面板 HTTP API 操作，因此不需要 -data/-db。
+// Config 是内置 MCP HTTP 端点连接面板所需的配置。
+// MCP 只通过面板 REST API 操作，不直接读写 SQLite。
 type Config struct {
 	BaseURL string
 	Token   string
 	Timeout time.Duration
-	// TokenSource 可选：面板运行中改 token 时，HTTP MCP 内部调用应立即使用新值。
+	// TokenSource 可选：面板运行中改 token 时，MCP 内部调用应立即使用新值。
 	// 为空时使用 Token。
 	TokenSource func() string
-}
-
-// LoadConfig 从环境变量读取配置，供 SvcDeck.exe -mcp 使用。
-// 命令行覆盖（-url / -token）由根包 main.go 在调用 Run 前处理。
-func LoadConfig() (Config, error) {
-	base := strings.TrimSpace(os.Getenv("SVCDECK_URL"))
-	if base == "" {
-		base = defaultAPIURL
-	}
-
-	timeout := 15 * time.Second
-	if raw := strings.TrimSpace(os.Getenv("SVCDECK_TIMEOUT_SEC")); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 || n > 120 {
-			return Config{}, fmt.Errorf("SVCDECK_TIMEOUT_SEC 必须是 1..120 的整数")
-		}
-		timeout = time.Duration(n) * time.Second
-	}
-
-	return Config{
-		BaseURL: base,
-		Token:   strings.TrimSpace(os.Getenv("SVCDECK_TOKEN")),
-		Timeout: timeout,
-	}, nil
 }
 
 func (c Config) normalized() (Config, error) {
@@ -57,19 +31,19 @@ func (c Config) normalized() (Config, error) {
 	}
 	u, err := url.Parse(c.BaseURL)
 	if err != nil {
-		return Config{}, fmt.Errorf("SVCDECK_URL 无效: %w", err)
+		return Config{}, fmt.Errorf("面板地址无效: %w", err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return Config{}, fmt.Errorf("SVCDECK_URL 必须是 http/https 地址: %s", c.BaseURL)
+		return Config{}, fmt.Errorf("面板地址必须是 http/https: %s", c.BaseURL)
 	}
 	if u.Host == "" {
-		return Config{}, fmt.Errorf("SVCDECK_URL 缺少主机名: %s", c.BaseURL)
+		return Config{}, fmt.Errorf("面板地址缺少主机名: %s", c.BaseURL)
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = 15 * time.Second
 	}
 	if c.Timeout > 120*time.Second {
-		return Config{}, fmt.Errorf("SVCDECK_TIMEOUT_SEC 不能超过 120")
+		return Config{}, fmt.Errorf("MCP 请求超时不能超过 120s")
 	}
 	c.BaseURL = strings.TrimRight(c.BaseURL, "/")
 	c.Token = strings.TrimSpace(c.Token)
@@ -151,7 +125,7 @@ func (c *apiClient) do(ctx context.Context, method, path string, query url.Value
 			msg = http.StatusText(resp.StatusCode)
 		}
 		if resp.StatusCode == http.StatusUnauthorized {
-			msg += "（检查 SVCDECK_TOKEN 环境变量）"
+			msg += "（检查面板访问令牌）"
 		}
 		return nil, fmt.Errorf("SvcDeck API %s %s 返回 HTTP %d: %s", method, path, resp.StatusCode, msg)
 	}

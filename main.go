@@ -27,71 +27,11 @@ var webFS embed.FS
 const singletonName = `Local\SvcDeck_Panel_Singleton_v1`
 
 func main() {
-	// MCP 模式必须在 attachParentConsole / 单例 / flag.Parse 之前分流：
-	// stdio MCP 独占 stdin/stdout，不能把标准流重绑到父控制台，也不能去抢面板单例。
-	if isMCPMode(os.Args[1:]) {
-		if err := runMCP(os.Args[1:]); err != nil {
-			fmt.Fprintln(os.Stderr, "svcdeck-mcp:", err)
-			os.Exit(1)
-		}
-		return
-	}
-
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	if err := run(); err != nil {
 		log.Printf("[panel] 退出: %v", err)
 		os.Exit(1)
 	}
-}
-
-func isMCPMode(args []string) bool {
-	if len(args) == 0 {
-		return false
-	}
-	switch args[0] {
-	case "mcp", "-mcp", "--mcp":
-		return true
-	}
-	return false
-}
-
-// runMCP 用同一个 SvcDeck.exe 以 stdio MCP Server 运行，不再单独编译 exe。
-// 它只通过面板 HTTP API 操作；面板可以继续以普通模式运行。
-func runMCP(args []string) error {
-	log.SetFlags(0)
-	log.SetPrefix("[svcdeck-mcp] ")
-
-	cfg, err := mcpserver.LoadConfig()
-	if err != nil {
-		return err
-	}
-
-	fs := flag.NewFlagSet("svcdeck-mcp", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	urlOverride := fs.String("url", "", "面板地址（覆盖 SVCDECK_URL，例如 http://127.0.0.1:8088）")
-	tokenOverride := fs.String("token", "", "面板访问令牌（覆盖 SVCDECK_TOKEN；建议用环境变量，避免出现在命令行）")
-
-	clean := args
-	if len(args) > 0 {
-		switch args[0] {
-		case "mcp", "-mcp", "--mcp":
-			clean = args[1:]
-		}
-	}
-	if err := fs.Parse(clean); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
-		}
-		return err
-	}
-	if *urlOverride != "" {
-		cfg.BaseURL = *urlOverride
-	}
-	if *tokenOverride != "" {
-		cfg.Token = *tokenOverride
-	}
-
-	return mcpserver.Run(cfg, os.Stdin, os.Stdout)
 }
 
 func run() error {
