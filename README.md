@@ -19,7 +19,7 @@ SvcDeck 是一个**单二进制** Windows 本地服务面板，用来管理一�
 
 ## 功能
 
-- **探针看板**：总数 / UP / DOWN / 熔断统计，DOWN 置顶，4 秒轮询，日志抽屉。
+- **探针看板**：总数 / UP / DOWN / 熔断统计，DOWN 置顶，4 秒轮询，日志抽屉；HTTP 探针服务可一键「打开」配置的探针 URL（新窗口）。
 - **服务管理**：CRUD、依赖拓扑、启用开关、HTTP/TCP/进程探针、保活退避、运行中配置变更提示「需 Restart」。
 - **全局设置**：探针间隔、失败阈值、停止宽限、日志上限、Webhook、监听地址、Token、等依赖 UP、删除运行中服务。
 - **运维**：命名 Mutex 单例、SQLite WAL、adopt、端口残留清理、熔断持久化、按服务粒度 taskkill。
@@ -27,7 +27,7 @@ SvcDeck 是一个**单二进制** Windows 本地服务面板，用来管理一�
 
 ## 快速开始
 
-要求 Go 1.26+（开发验证于 Go 1.27 / Windows amd64）。第三方依赖只有 `golang.org/x/sys/windows` 和纯 Go 的 `modernc.org/sqlite`。
+要求 Go 1.27.4+（低于该版本的标准库 `net/http` 有已修复的 HTTP/1 崩溃漏洞；`go.mod` 已声明该版本，Go 会自动切换 toolchain）。第三方依赖只有 `golang.org/x/sys/windows` 和纯 Go 的 `modernc.org/sqlite`。
 
 ```powershell
 # 开发版：带控制台，日志直接打在终端
@@ -184,7 +184,8 @@ WinSW 也可以，但必须确认它不会在停止时 `taskkill /T` 或使用�
 - Token 存在本机 SQLite，浏览器存在 localStorage；数据库目录建议限制 ACL。
 - 仅支持 Windows；Linux/macOS 不会编译通过。
 - 同一 exe 多实例：进程探针在 PID 缺失时无法区分归属，不会按 exe 猜测，也不会按 exe 清理；建议用 HTTP/TCP 探针或确保已记录各自 PID。
-- 禁用服务仍参与探针展示，但不会自动启动/保活；禁用**不会**停止已在运行的进程。
+- 服务 ID 会用作 `logs/<id>.log` 文件名：不能使用 `CON` / `PRN` / `AUX` / `NUL` / `COM1-9` / `LPT1-9` 等 Windows 设备名，也不能与现有 ID 仅大小写不同（Windows 文件名不区分大小写）。
+- 禁用服务不参与探测（不自动启动、不保活、不接管、不写探测历史），手动 Start/Restart 会提示先启用；界面显示「已禁用 · 不探测」。禁用**不会**停止已在运行的进程，其 PID 仍保留以便手动 Stop。
 - 修改 `listen_addr` 后需重启面板；`panel.log` 不参与 `log_max_mb` 轮转。
 - 面板默认不需要管理员权限；管理更高权限进程时需以对应权限运行，否则 `OpenProcess` / `taskkill` 会失败。
 

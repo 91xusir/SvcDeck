@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -78,6 +79,11 @@ func processAlive(pid uint32) bool {
 	}
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
+		// 权限不足时不能断言进程已退出；按“仍存活”处理，
+		// 否则 taskkill 拒绝访问后会被误判为“已经退出”，Stop 会假成功。
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return true
+		}
 		return false
 	}
 	defer windows.CloseHandle(h)

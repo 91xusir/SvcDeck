@@ -128,7 +128,7 @@ func (s *Server) initialize(raw json.RawMessage) map[string]any {
 			"name":    serverName,
 			"version": serverVersion,
 		},
-		"instructions": "SvcDeck 是 Windows 裸 exe 服务面板。新增服务用 add_service：exe 必须是面板所在机器上的绝对路径；enabled=false 只登记不启动，enabled=true 会立即拉起。update_service 是局部合并（先 GET 再 PUT）。stop_service / delete_service 是破坏性操作，必须先得到用户明确确认。",
+		"instructions": "SvcDeck 是 Windows 裸 exe 服务面板。新增服务用 add_service：exe 必须是面板所在机器上的绝对路径；enabled=false 只登记配置，不启动也不探测；enabled=true 会立即拉起。update_service 是局部合并（先 GET 再 PUT）。stop_service / delete_service 是破坏性操作，必须先得到用户明确确认。",
 	}
 }
 
@@ -148,9 +148,14 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) any {
 		return toolError(errors.New("未知工具: " + p.Name))
 	}
 
+	// 普通工具 45s；restart_all 会按依赖逐个 Stop/Start，服务多时可能远超 45s。
+	timeout := 45 * time.Second
+	if p.Name == "restart_all" {
+		timeout = 10 * time.Minute
+	}
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 45*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 

@@ -130,7 +130,9 @@ func run() error {
 	mcpHTTP, err := mcpserver.NewHTTPHandler(mcpserver.Config{
 		BaseURL: panelSelfURL(settings.ListenAddr),
 		Token:   settings.Token,
-		Timeout: 15 * time.Second,
+		// 普通工具由 mcpserver 的 45s 上下文限制；restart_all 在工具内部放宽到 10m，
+		// 因此 HTTP 客户端本身不能再短于这个值。
+		Timeout: 10 * time.Minute,
 		// 面板运行中改 token 后，MCP 内部调用也要立刻用新 token；
 		// 外部客户端仍需在请求头里带同一个 token（见 README §6.3）。
 		TokenSource: func() string { return cfgStore.Get().Token },

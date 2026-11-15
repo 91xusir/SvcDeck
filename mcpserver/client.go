@@ -42,8 +42,8 @@ func (c Config) normalized() (Config, error) {
 	if c.Timeout <= 0 {
 		c.Timeout = 15 * time.Second
 	}
-	if c.Timeout > 120*time.Second {
-		return Config{}, fmt.Errorf("MCP 请求超时不能超过 120s")
+	if c.Timeout > 10*time.Minute {
+		return Config{}, fmt.Errorf("MCP 请求超时不能超过 10m")
 	}
 	c.BaseURL = strings.TrimRight(c.BaseURL, "/")
 	c.Token = strings.TrimSpace(c.Token)

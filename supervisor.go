@@ -333,7 +333,6 @@ func (s *Supervisor) AutoStart(id string) {
 
 func (s *Supervisor) probeLoop() {
 	defer s.wg.Done()
-	interval := s.interval()
 	timer := time.NewTimer(500 * time.Millisecond)
 	defer timer.Stop()
 	for {
@@ -342,18 +341,16 @@ func (s *Supervisor) probeLoop() {
 			return
 		case <-s.kick:
 			// 配置变更后按新间隔重新计时
-			interval = s.interval()
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
 				default:
 				}
 			}
-			timer.Reset(interval)
+			timer.Reset(s.interval())
 		case <-timer.C:
 			s.tick()
-			interval = s.interval()
-			timer.Reset(interval)
+			timer.Reset(s.interval())
 		}
 	}
 }
@@ -377,10 +374,14 @@ func (s *Supervisor) tick() {
 	sem := make(chan struct{}, 16)
 	var wg sync.WaitGroup
 	for _, rt := range list {
+		// 禁用的服务只登记配置：不探测、不接管、不保活。
+		cfg, st, _, _, _ := s.snapshot(rt)
+		if !cfg.Enabled {
+			continue
+		}
 		if !rt.probing.CompareAndSwap(false, true) {
 			continue
 		}
-		cfg, st, _, _, _ := s.snapshot(rt)
 		uniqueExe := s.exeUnique(cfg.Exe)
 		wg.Add(1)
 		sem <- struct{}{}
@@ -409,12 +410,15 @@ func (s *Supervisor) probeNow(rt *svcRT) {
 	if rt.removed.Load() || s.ctx.Err() != nil {
 		return
 	}
+	cfg, st, _, _, _ := s.snapshot(rt)
+	if !cfg.Enabled {
+		return // 禁用的服务不探测
+	}
 	if !rt.probing.CompareAndSwap(false, true) {
 		return // 已有一次探针在跑，这次的“即时”请求直接让路
 	}
 	defer rt.probing.Store(false)
 
-	cfg, st, _, _, _ := s.snapshot(rt)
 	res := probeService(s.ctx, s.client, cfg, st, s.exeUnique(cfg.Exe))
 	s.applyProbe(rt, res)
 }
@@ -452,6 +456,10 @@ func (s *Supervisor) applyProbe(rt *svcRT, res ProbeResult) {
 	settings := s.cfgStore.Get()
 	// 先拿配置快照再算 exe 唯一性（exeUnique 用独立的 metaMu，不会与 rt.mu 形成锁环）。
 	cfg, _, _, _, _ := s.snapshot(rt)
+	if !cfg.Enabled {
+		// 探针在飞行途中被禁用：丢弃结果，避免把已关闭的服务重新标成 UP / 接管 PID。
+		return
+	}
 	uniqueExe := s.exeUnique(cfg.Exe)
 
 	var needRestart, circuitNow bool
@@ -462,6 +470,11 @@ func (s *Supervisor) applyProbe(rt *svcRT, res ProbeResult) {
 		rt.mu.Unlock()
 		return
 	}
+	if !rt.cfg.Enabled {
+		// 与上面的无锁检查配合，覆盖“探针返回后、写状态前”被禁用的窄窗口。
+		rt.mu.Unlock()
+		return
+	}
 	rt.lastCheck = now.Unix()
 	rt.rtMs = res.RTMs
 	rt.st.LastCheck = now.Unix()
@@ -469,6 +482,16 @@ func (s *Supervisor) applyProbe(rt *svcRT, res ProbeResult) {
 	rt.st.UpdatedAt = nowStamp()
 
 	if res.Up {
+		// 探针 UP 时也校验记录的 pid：HTTP/TCP 探针不会校验 pid，
+		// 若条目标记的进程已退出或被复用，必须先清理，否则 UI 会一直显示错误的 PID。
+		if rt.st.PID != 0 {
+			if ok, why := verifyProcess(rt.st.PID, rt.st.ExePath, rt.st.ProcessStartTime); !ok {
+				log.Printf("[svc:%s] 探针 UP 但记录的 pid 已失效: %s；清理后按探针重新接管", rt.cfg.ID, why)
+				rt.st.PID = 0
+				rt.st.ExePath = ""
+				rt.st.ProcessStartTime = 0
+			}
+		}
 		rt.st.LastUp = true
 		rt.st.ConsecutiveFails = 0
 		rt.st.Retries = 0
@@ -584,10 +607,10 @@ func (s *Supervisor) runtimeView(cfg Service, st RuntimeState, rtMs, lastCheck i
 		// Stop 已经发起但进程还没走：此时 pid 和 last_up 都可能还是旧值，
 		// 必须优先显示「停止中」，否则 UI 会一直显示 UP 直到 taskkill 完成。
 		state = "stopping"
-	case st.LastUp:
-		state = "up"
 	case !cfg.Enabled:
 		state = "disabled"
+	case st.LastUp:
+		state = "up"
 	case st.CircuitOpen:
 		state = "circuit"
 	case st.ManualStop:
@@ -600,6 +623,17 @@ func (s *Supervisor) runtimeView(cfg Service, st RuntimeState, rtMs, lastCheck i
 	pending := false
 	if st.PID != 0 && st.StartSignature != "" {
 		pending = launchSignature(cfg) != st.StartSignature
+	}
+	if state == "disabled" {
+		// 禁用的服务不探测：不展示任何探测结果，只保留 PID 以便手动 Stop。
+		return RuntimeView{
+			Running:        st.PID != 0,
+			PID:            st.PID,
+			State:          "disabled",
+			ManualStop:     st.ManualStop,
+			PendingRestart: pending,
+			ProbeDesc:      probeDescription(cfg),
+		}
 	}
 	return RuntimeView{
 		Running:          st.PID != 0,
@@ -764,6 +798,10 @@ func (s *Supervisor) ensureRunningLocked(rt *svcRT, reason string) error {
 		return fmt.Errorf("面板正在退出，取消启动")
 	}
 	cfg, st, _, _, _ := s.snapshot(rt)
+	if !cfg.Enabled {
+		// 配置可能在 Start 检查之后被并发禁用；这里再挡一次，避免禁用后仍被拉起。
+		return fmt.Errorf("服务已禁用，跳过启动")
+	}
 	uniqueExe := s.exeUnique(cfg.Exe)
 
 	if st.PID != 0 {
@@ -824,6 +862,10 @@ func (s *Supervisor) spawnLocked(rt *svcRT, reason string) error {
 	cfg, st, _, _, _ := s.snapshot(rt)
 	if rt.removed.Load() {
 		return fmt.Errorf("服务已删除")
+	}
+	if !cfg.Enabled {
+		// 与 ensureRunningLocked 的检查配合，覆盖“检查后、spawn 前”被禁用的窄窗口。
+		return fmt.Errorf("服务已禁用，跳过启动")
 	}
 
 	// 端口占用保护：多半是上次残留。只按 DB 记录/唯一 exe 清理，绝不杀未知进程。
@@ -930,7 +972,7 @@ func (s *Supervisor) stopLocked(rt *svcRT, markManual bool) error {
 		}
 	}
 
-	if pid == 0 && st.LastUp {
+	if pid == 0 && st.LastUp && cfg.Enabled {
 		return fmt.Errorf("服务探针为 UP，但无法定位其进程（exe 可能被多个服务共享）；请在目标机上确认后再操作")
 	}
 
@@ -1055,6 +1097,10 @@ func (s *Supervisor) StartService(id string) error {
 		return fmt.Errorf("服务不存在: %s", id)
 	}
 	rt.opMu.Lock()
+	if cfg, _, _, _, _ := s.snapshot(rt); !cfg.Enabled {
+		rt.opMu.Unlock()
+		return fmt.Errorf("服务已禁用，请先启用")
+	}
 	rt.mu.Lock()
 	rt.st.ManualStop = false
 	rt.st.CircuitOpen = false
@@ -1097,6 +1143,10 @@ func (s *Supervisor) RestartService(id string) error {
 		return fmt.Errorf("服务不存在: %s", id)
 	}
 	rt.opMu.Lock()
+	if cfg, _, _, _, _ := s.snapshot(rt); !cfg.Enabled {
+		rt.opMu.Unlock()
+		return fmt.Errorf("服务已禁用，请先启用")
+	}
 	rt.mu.Lock()
 	rt.st.ManualStop = false
 	rt.st.CircuitOpen = false

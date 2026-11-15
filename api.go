@@ -18,6 +18,17 @@ import (
 
 var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 
+// 这些名字在 Windows 上是设备名，logs/<id>.log 会被当成设备而不是普通文件。
+func isWindowsDeviceID(id string) bool {
+	switch strings.ToUpper(id) {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return true
+	}
+	return false
+}
+
 type API struct {
 	store   *Store
 	sup     *Supervisor
@@ -272,7 +283,7 @@ func (a *API) startService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.sup.StartService(id); err != nil {
-		a.fail(w, http.StatusInternalServerError, "启动失败: %v", err)
+		a.fail(w, http.StatusConflict, "启动失败: %v", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "启动指令已执行"})
@@ -298,7 +309,7 @@ func (a *API) restartService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.sup.RestartService(id); err != nil {
-		a.fail(w, http.StatusInternalServerError, "重启失败: %v", err)
+		a.fail(w, http.StatusConflict, "重启失败: %v", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已重启"})
@@ -374,9 +385,11 @@ func readTailLines(path string, maxLines int) ([]string, int64, error) {
 	defer f.Close()
 	buf := make([]byte, size-start)
 	if len(buf) > 0 {
-		if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
+		n, err := f.ReadAt(buf, start)
+		if err != nil && err != io.EOF {
 			return nil, 0, err
 		}
+		buf = buf[:n] // 文件在 Stat 与 Read 之间被轮转/截断时，别把尾部零字节当成日志
 	}
 	text := strings.ReplaceAll(string(buf), "\r\n", "\n")
 	all := strings.Split(text, "\n")
@@ -534,16 +547,28 @@ func (a *API) normalizeService(in Service, creating bool) (Service, error) {
 		}
 		ids := map[string]bool{}
 		for _, s := range all {
-			ids[s.ID] = true
+			ids[strings.ToLower(s.ID)] = true
 		}
 		candidate := base
-		for i := 2; ids[candidate]; i++ {
+		for i := 2; ids[strings.ToLower(candidate)]; i++ {
 			candidate = fmt.Sprintf("%s-%d", base, i)
 		}
 		in.ID = candidate
 	}
 	if !idPattern.MatchString(in.ID) {
 		return Service{}, fmt.Errorf("ID 只能由字母/数字/下划线/短横线组成，最长 64，且不能以符号开头")
+	}
+	if isWindowsDeviceID(in.ID) {
+		return Service{}, fmt.Errorf("ID 不能使用 Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）")
+	}
+	for _, s := range all {
+		if s.ID == in.ID {
+			continue // 更新自身
+		}
+		if strings.EqualFold(s.ID, in.ID) {
+			// Windows 日志文件名不区分大小写，Foo 与 foo 会写到同一个 logs/<id>.log。
+			return Service{}, fmt.Errorf("ID %q 与现有服务 %q 仅大小写不同，日志文件会冲突", in.ID, s.ID)
+		}
 	}
 	if creating {
 		if _, exists, err := a.store.GetService(in.ID); err != nil {

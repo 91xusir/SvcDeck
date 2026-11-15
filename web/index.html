@@ -300,20 +300,22 @@
     }
     .card-error.hidden { display: none; }
     .card-foot {
-      display: flex; align-items: center; gap: 6px;
+      display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 6px;
       border-top: 1px dashed var(--line); padding-top: 10px; margin-top: auto;
-      flex-wrap: wrap;
     }
     .pid-chip {
       font-family: var(--mono); font-size: 10px; color: var(--muted);
       background: var(--surface-2); border: 1px solid #eef2f7; border-radius: 6px;
       padding: 3px 6px; white-space: nowrap;
     }
-    .card-actions { margin-left: auto; display: flex; gap: 4px; flex-wrap: wrap; }
+    .card-actions {
+      display: flex; justify-content: flex-end; gap: 3px; flex-wrap: wrap; min-width: 0;
+    }
     .link-btn {
+      display: inline-block; text-decoration: none;
       border: 1px solid transparent; background: transparent;
-      font-size: 11.5px; font-weight: 600; color: var(--muted);
-      padding: 4px 7px; border-radius: 6px; transition: .15s;
+      font-size: 11px; font-weight: 600; color: var(--muted);
+      padding: 4px 6px; border-radius: 6px; transition: .15s;
     }
     .link-btn:hover { background: var(--surface-3); color: var(--text); }
     .link-btn.primary { color: var(--primary); }
@@ -370,6 +372,7 @@
     .probe-badge.http { background: #eef6ff; color: #1d4ed8; }
     .probe-badge.tcp { background: #f0fdf4; color: #15803d; }
     .probe-badge.process { background: #f8fafc; color: #475569; }
+    .probe-badge.off { background: #f1f5f9; color: #94a3b8; }
     .probe-text {
       display: inline; font-family: var(--mono); font-size: 11px; color: var(--muted);
       word-break: break-all;
@@ -1071,8 +1074,6 @@
       config: null,
       token: localStorage.getItem("svcdeck_token") || "",
       pollTimer: null,
-      statusLoading: false,
-      servicesLoading: false,
       lastRefresh: 0,
       editing: null,
       idDirty: false,
@@ -1167,6 +1168,25 @@
       return parts.length ? parts[parts.length - 1] : path;
     }
 
+    // 取 HTTP 探针配置的页面地址；只允许 http/https，避免把旧数据里的异常协议
+    // 当成可点击链接。dashboard 的 status 项不带 probe_url，回落到 services 配置。
+    function probeURLFor(item) {
+      if (!item || item.probe_type !== "http") return "";
+      let raw = String(item.probe_url || "").trim();
+      if (!raw) {
+        const svc = state.services.find((s) => s.id === item.id);
+        raw = String((svc && svc.probe_url) || "").trim();
+      }
+      if (!raw) return "";
+      try {
+        const u = new URL(raw);
+        if (u.protocol !== "http:" && u.protocol !== "https:") return "";
+        return u.href;
+      } catch (_) {
+        return "";
+      }
+    }
+
     function fmtBytes(n) {
       if (!n) return "0 B";
       if (n < 1024) return n + " B";
@@ -1217,9 +1237,30 @@
     /* =========================================================
      * 加载与轮询
      * ======================================================= */
-    async function loadStatus() {
-      if (state.statusLoading) return;
-      state.statusLoading = true;
+    /* 请求去重 + 动作后的强制补刷：
+     * 已有请求在飞行中时，不能直接 return——它可能是动作之前发出的，内容已经过期。
+     * 这里把后来的调用挂到“当前请求结束后再发一次”的队列上，保证 Start/Stop/编辑后
+     * 总能拿到动作之后的状态，而不是等下一次 4s/60s 轮询。 */
+    let statusRequest = null;
+    let statusQueued = null;
+    let servicesRequest = null;
+    let servicesQueued = null;
+
+    function loadStatus() {
+      if (!statusRequest) {
+        statusRequest = fetchStatus().finally(() => { statusRequest = null; });
+        return statusRequest;
+      }
+      if (!statusQueued) {
+        statusQueued = statusRequest.catch(() => {}).then(() => {
+          statusQueued = null;
+          return loadStatus();
+        });
+      }
+      return statusQueued;
+    }
+
+    async function fetchStatus() {
       try {
         const data = await api("/api/status");
         state.status = Array.isArray(data.items) ? data.items : [];
@@ -1235,21 +1276,30 @@
           $("last-refresh").textContent = "刷新失败 · 将自动重试";
         }
         throw err;
-      } finally {
-        state.statusLoading = false;
       }
     }
 
-    async function loadServices() {
-      if (state.servicesLoading) return;
-      state.servicesLoading = true;
-      try {
-        const data = await api("/api/services");
-        state.services = Array.isArray(data.items) ? data.items : [];
-        renderServices();
-      } finally {
-        state.servicesLoading = false;
+    function loadServices() {
+      if (!servicesRequest) {
+        servicesRequest = fetchServices().finally(() => { servicesRequest = null; });
+        return servicesRequest;
       }
+      if (!servicesQueued) {
+        servicesQueued = servicesRequest.catch(() => {}).then(() => {
+          servicesQueued = null;
+          return loadServices();
+        });
+      }
+      return servicesQueued;
+    }
+
+    async function fetchServices() {
+      const data = await api("/api/services");
+      state.services = Array.isArray(data.items) ? data.items : [];
+      renderServices();
+      // /api/status 不含 probe_url，卡片上的「打开」依赖刚加载的服务配置；
+      // 如果 loadStatus 先完成，这里补刷一次，避免按钮要等下一轮轮询才出现。
+      if (state.status.length) renderDashboard();
     }
 
     async function loadConfig() {
@@ -1408,8 +1458,13 @@
       refs.start = el("button", { className: "link-btn primary", type: "button", "data-action": "start" }, "Start");
       refs.stop = el("button", { className: "link-btn danger", type: "button", "data-action": "stop" }, "Stop");
       refs.restart = el("button", { className: "link-btn", type: "button", "data-action": "restart" }, "Restart");
+      refs.open = el("a", {
+        className: "link-btn hidden",
+        target: "_blank",
+        rel: "noopener noreferrer",
+      }, "打开");
       refs.logs = el("button", { className: "link-btn", type: "button", "data-action": "logs" }, "日志");
-      const actions = el("div", { className: "card-actions" }, refs.start, refs.stop, refs.restart, refs.logs);
+      const actions = el("div", { className: "card-actions" }, refs.start, refs.stop, refs.restart, refs.open, refs.logs);
       const foot = el("div", { className: "card-foot" }, refs.pid, actions);
 
       card = el("article", { className: "card", "data-id": item.id, "data-state": item.state },
@@ -1434,8 +1489,20 @@
       r.nameText.textContent = item.name || item.id;
       r.name.title = item.name || item.id;
       r.id.textContent = item.id;
-      r.desc.textContent = item.probe_desc || item.probe_type || "";
+      const disabled = item.enabled === false;
+      r.desc.textContent = disabled ? "已禁用 · 不探测" : (item.probe_desc || item.probe_type || "");
       r.desc.title = r.desc.textContent;
+
+      const openURL = probeURLFor(item);
+      if (openURL) {
+        r.open.href = openURL;
+        r.open.title = "打开服务页面（新窗口）：" + openURL;
+        r.open.classList.remove("hidden");
+      } else {
+        r.open.removeAttribute("href");
+        r.open.title = "";
+        r.open.classList.add("hidden");
+      }
 
       r.rt.textContent = item.last_check ? ((Number(item.rt_ms) || 0) + " ms") : "—";
       r.check.textContent = timeAgo(item.last_check);
@@ -1458,12 +1525,12 @@
         r.pid.title = "";
       }
 
-      r.start.disabled = !!item.running || item.state === "up";
-      r.start.title = r.start.disabled ? "服务已在运行" : "启动服务";
+      r.start.disabled = disabled || !!item.running || item.state === "up";
+      r.start.title = disabled ? "服务已禁用，请先启用" : (r.start.disabled ? "服务已在运行" : "启动服务");
       r.stop.disabled = !item.running || item.state === "stopping";
       r.stop.title = item.state === "stopping" ? "正在停止（等待进程退出）" : (item.running ? "停止该服务自己的进程树" : "面板未托管该服务的 pid");
-      r.restart.disabled = !item.pid && !!item.up;
-      r.restart.title = r.restart.disabled ? "探针 UP 但面板未托管 pid，无法重启" : "停止并重新启动";
+      r.restart.disabled = disabled || (!item.pid && !!item.up);
+      r.restart.title = disabled ? "服务已禁用，请先启用" : (r.restart.disabled ? "探针 UP 但面板未托管 pid，无法重启" : "停止并重新启动");
       r.logs.disabled = false;
     }
 
@@ -1592,10 +1659,15 @@
       const name = el("div", { className: "svc-name" }, dot, el("span", null, svc.name || svc.id));
       const id = el("div", { className: "svc-id" }, svc.id);
 
-      const probe = el("div", { className: "probe-cell" },
-        probeBadge(svc.probe_type),
-        el("span", { className: "probe-text" }, svc.runtime ? svc.runtime.probe_desc : "")
-      );
+      const probe = svc.enabled
+        ? el("div", { className: "probe-cell" },
+            probeBadge(svc.probe_type),
+            el("span", { className: "probe-text" }, svc.runtime ? svc.runtime.probe_desc : "")
+          )
+        : el("div", { className: "probe-cell", title: "禁用后不探测；重新启用即恢复" },
+            el("span", { className: "probe-badge off" }, "OFF"),
+            el("span", { className: "probe-text" }, "已禁用 · 不探测")
+          );
 
       const exeName = el("div", { className: "exe-name" }, basename(svc.exe));
       const exePath = el("div", { className: "exe-path" }, svc.exe);
@@ -1617,6 +1689,21 @@
       sw.checked = !!svc.enabled;
       sw.addEventListener("change", () => toggleService(svc, sw.checked, sw));
 
+      const openURL = probeURLFor(svc);
+      const open = openURL
+        ? el("a", {
+            className: "link-btn",
+            href: openURL,
+            target: "_blank",
+            rel: "noopener noreferrer",
+            title: "打开服务页面（新窗口）",
+          }, "打开")
+        : el("span", {
+            className: "link-btn",
+            title: "仅 HTTP 探针可打开；当前探针类型：" + (svc.probe_type || "process"),
+            style: "opacity:.38;cursor:not-allowed",
+          }, "打开");
+
       const edit = el("button", { className: "link-btn", type: "button" }, "编辑");
       edit.addEventListener("click", () => openServiceForm(svc));
       const logs = el("button", { className: "link-btn", type: "button" }, "日志");
@@ -1630,7 +1717,7 @@
         el("td", { className: "exe-cell" }, exeName, exePath),
         el("td", null, deps),
         el("td", null, sw),
-        el("td", null, el("div", { className: "row-actions", style: "justify-content:flex-end" }, edit, logs, del)),
+        el("td", null, el("div", { className: "row-actions", style: "justify-content:flex-end" }, open, edit, logs, del)),
       );
       return row;
     }
@@ -1662,7 +1749,7 @@
           method: "PUT",
           body: JSON.stringify({ ...servicePayload(svc), enabled }),
         });
-        toast((enabled ? "已启用 " : "已禁用 ") + (svc.name || svc.id) + "（" + (enabled ? "已纳入自动启动/保活" : "不再自动拉起") + "）", "success");
+        toast((enabled ? "已启用 " : "已禁用 ") + (svc.name || svc.id) + "（" + (enabled ? "已纳入自动启动/保活" : "不再自动拉起，也不再探测") + "）", "success");
         await loadServices();
         await loadStatus();
         if (res.pending_restart) toast("启动配置有变更，运行中的服务需 Restart 才生效", "warn", 6000);

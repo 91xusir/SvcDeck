@@ -45,7 +45,7 @@ var tools = []toolDef{
 	{
 		name: "add_service",
 		description: "新增一个裸 exe 服务。exe 必须是面板所在 Windows 机器上的绝对路径。" +
-			"enabled=true 会立即按依赖启动，enabled=false 只登记配置；省略 ID 时按 name 自动生成。" +
+			"enabled=true 会立即按依赖启动，enabled=false 只登记配置（不启动、不探测）；省略 ID 时按 name 自动生成。" +
 			"探针默认 process，可选 http/tcp。",
 		schema:   objSchema(serviceProps(), "name", "exe"),
 		handler:  addService,
@@ -60,7 +60,7 @@ var tools = []toolDef{
 	},
 	{
 		name:        "start_service",
-		description: "手动启动服务，清除 manual_stop 与熔断状态。",
+		description: "手动启动服务，清除 manual_stop 与熔断状态。禁用的服务需先 update_service 启用。",
 		schema:      objSchema(map[string]any{"id": idProp()}, "id"),
 		handler:     startService,
 	},
@@ -73,7 +73,7 @@ var tools = []toolDef{
 	},
 	{
 		name:        "restart_service",
-		description: "先停后起该服务，清除 manual_stop 与熔断。会终止并重新拉起进程，需用户确认。",
+		description: "先停后起该服务，清除 manual_stop 与熔断。会终止并重新拉起进程，需用户确认。禁用的服务需先启用。",
 		schema:      objSchema(map[string]any{"id": idProp()}, "id"),
 		handler:     restartService,
 		destructive: true,

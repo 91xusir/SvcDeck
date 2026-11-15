@@ -13,8 +13,7 @@ import (
 // Store 包装 SQLite。连接数固定为 1：面板的写操作很频繁（每个探针周期都会写 runtime_state），
 // 单连接可以把锁竞争降到零，同时 WAL 仍然保证崩溃安全。
 type Store struct {
-	db   *sql.DB
-	path string
+	db *sql.DB
 }
 
 func OpenStore(path string) (*Store, error) {
@@ -38,7 +37,7 @@ func OpenStore(path string) (*Store, error) {
 			return nil, fmt.Errorf("执行 %s 失败: %w", pragma, err)
 		}
 	}
-	s := &Store{db: db, path: path}
+	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
