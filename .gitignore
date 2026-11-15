@@ -1,0 +1,20 @@
+# Build artifacts
+/SvcDeck.exe
+/*.exe~
+/*.test
+
+# Runtime data (SvcDeck -data .)
+/panel.db
+/panel.db-shm
+/panel.db-wal
+/logs/
+
+# Local test / temporary directories
+/.tmp*/
+/.smoke*/
+/_dev/
+
+# Editor / OS noise
+/.vscode/
+/.idea/
+/Thumbs.db
