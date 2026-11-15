@@ -32,6 +32,16 @@ func main() {
 }
 
 func run() error {
+	// 0) 控制台：windowsgui 构建的进程默认没有终端。
+	//    从 cmd/PowerShell 启动时接上父控制台，日志直接打在终端；
+	//    双击启动时接不上，静默运行（日志改写到 logs/panel.log，见下）。
+	//    必须在 flag.Parse 之前，否则 -h / 参数报错的信息也没有地方可写。
+	hasConsole := attachParentConsole()
+	if hasConsole {
+		// log 包在 init 时已抓取旧的 os.Stderr，重定向后必须显式重设。
+		log.SetOutput(os.Stderr)
+	}
+
 	var (
 		dataDir string
 		dbPath  string
@@ -68,6 +78,13 @@ func run() error {
 	logDir := filepath.Join(dataDir, "logs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return fmt.Errorf("创建日志目录 %s 失败: %w", logDir, err)
+	}
+	if !hasConsole {
+		// 双击启动没有终端，stderr 是无效句柄，日志会全部丢失：落盘留痕。
+		if f, err := os.OpenFile(filepath.Join(logDir, "panel.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+			log.SetOutput(f)
+			defer f.Close()
+		}
 	}
 
 	// 2) SQLite：全部数据（配置、运行态、设置、探测历史）

@@ -1,3 +1,5 @@
+<div align="center"><img src="https://img.shields.io/badge/Contribution-cccccc" alt="Contribution"><img src="https://img.shields.io/badge/🤖%20Agent-100%25-94C9E7" alt="Agent"><img src="https://img.shields.io/badge/🧑‍💻%20Human-0%25-A86F4D" alt="Human"></div>
+
 # SvcDeck · Windows 本地服务面板
 
 SvcDeck 是一个**单二进制**的 Windows 本地服务面板，用来管理一批**不注册为 Windows 服务**的裸 exe 业务程序。
@@ -105,8 +107,15 @@ SvcDeck/
 
 ```powershell
 go mod tidy
+
+# 1) 开发/排障：console 子系统，日志直接打在终端（双击运行会多一个黑窗口）
 go build -trimpath -ldflags "-s -w" -o SvcDeck.exe .
+
+# 2) 交付：GUI 子系统，双击无窗口；从终端启动时自动接管父控制台（见 §3.4）
+go build -trimpath -ldflags "-s -w -H windowsgui" -o SvcDeck.exe .
 ```
+
+两条命令都验证过可构建。仅第二条带 `-H windowsgui`，它是「双击是否弹黑窗口」以及「面板日志写哪里」的分水岭。
 
 ### 3.3 运行
 
@@ -129,6 +138,30 @@ go build -trimpath -ldflags "-s -w" -o SvcDeck.exe .
 | `-token` | 覆盖数据库中的 `token`，仅本次进程有效。 |
 
 浏览器打开 `http://127.0.0.1:8088/`。
+
+### 3.4 日志去向：终端启动 vs 双击启动
+
+面板**自身**的日志（`log` 包输出：启动、adopt、探针、重启、退出）写到哪里，由「构建类型 + 启动方式」决定；业务进程的日志与它无关，始终各写各的 `logs/<服务 id>.log`，由 `log_max_mb` 轮转。
+
+| 构建 | 启动方式 | 面板日志去向 |
+| --- | --- | --- |
+| `-H windowsgui`（交付版） | 双击 / explorer / 开机自启 | `<data>/logs/panel.log`，无窗口、无控制台输出 |
+| `-H windowsgui` | 在 cmd / PowerShell 里执行 | 该终端窗口（stdout/stderr 已重绑到父控制台） |
+| `-H windowsgui` | `.\SvcDeck.exe > out.log 2>&1` | `out.log`（尊重重定向，不去抢控制台） |
+| 无 `-H windowsgui`（开发版） | 任意方式 | 进程自带的那个控制台 |
+
+背后的规则（`console_windows.go`）：
+
+- GUI 子系统进程启动时**没有控制台**，`os.Stdout/os.Stderr` 是无效句柄。面板在 `flag.Parse` 之前调用 `AttachConsole(ATTACH_PARENT_PROCESS)` 接上父控制台，再把标准流重新绑定到 `CONOUT$` / `CONIN$`，并给控制台句柄打开 `ENABLE_VIRTUAL_TERMINAL_PROCESSING`（ANSI 颜色码在该控制台生效；当前日志本身未使用颜色）。
+- 接不上父控制台（双击启动）时，日志改为**追加**写入 `<data>/logs/panel.log`。该文件不参与 `log_max_mb` 轮转，长期运行需自行清理或归档。
+- 判定顺序是：标准输出已被重定向到文件/管道 → 直接用重定向；否则尝试接父控制台；返回 `ERROR_ACCESS_DENIED`（进程本来就有控制台，如开发版构建）→ 用现有控制台；其余错误 → 落盘 `panel.log`。
+- 在终端里启动时，该终端的 Ctrl+C 会以 `CTRL_C_EVENT` 送到面板，走 §9 的优雅退出（只关 HTTP 与探针循环，不杀业务进程）。
+
+排障提示：
+
+- 双击启动后「什么都没发生」是正常的；去看 `<data>/logs/panel.log`，或从 cmd/PowerShell 启动一次以便实时看输出。
+- 交付版用 `> out.log` 时要带 `2>&1`：`log` 写的是 stderr，只重定向 stdout 会让日志落空。
+- 从终端启动时，程序退出后提示符可能紧贴最后一行日志，这是 Windows 控制台的固有行为，不影响使用。
 
 ---
 
@@ -544,12 +577,12 @@ Get-Process SvcDeck
 
 ## 13. 已知边界
 
-1. **仅 Windows**：`process_windows.go` / `singleton_windows.go` 使用 Windows API；Linux/macOS 不会编译通过。
+1. **仅 Windows**：`process_windows.go` / `singleton_windows.go` / `console_windows.go` 使用 Windows API（`console_other.go` 只是非 Windows 的空实现）；Linux/macOS 整包仍不会编译通过。
 2. **同 exe 多实例**：进程探针在 pid 缺失时无法区分归属，见 §10.2。
 3. **禁用服务**：仍参与探针展示，但不自动启动、不保活；状态显示为「已禁用」。禁用**不会**停止已经在运行的进程，需要 Stop 才会终止。
 4. **手动停止**：会一直抑制保活，直到手动 Start/Restart（这是有意设计，避免“按了 Stop 又被拉起”）。
 5. **监听地址**：修改 `/api/config` 的 `listen_addr` 后需要重启面板进程才生效。
-6. **日志轮转**：在 spawn 时按 `log_max_mb` 检查并轮转，不对正在写入的旧文件做在线切割。
+6. **日志轮转**：业务日志在 spawn 时按 `log_max_mb` 检查并轮转，不对正在写入的旧文件做在线切割；面板日志 `logs/panel.log` 不轮转，见 §3.4。
 7. **删除服务**：被其他服务依赖时拒绝删除；`allow_delete_running` 只影响“运行中删除”的默认行为。
 8. **面板自身单例按会话**：跨会话由端口占用兜底；不要把同一数据目录交给两个面板同时写。
 9. **进程启动宽限**：默认至少 15 秒，慢启动服务建议调大 `probe_timeout_sec`，宽限会随之增大。
@@ -604,3 +637,30 @@ A：可以配置，但面板自身需以足够权限运行，否则 `OpenProcess
 
 **Q：数据库能备份吗？**  
 A：停面板后复制 `panel.db`（以及 `-wal` / `-shm`）即可；运行中请使用 SQLite 在线备份，不要直接复制。
+
+---
+
+## 16. 代码贡献
+
+统计快照：首个提交 `cb02e08 feat: SvcDeck Windows local service panel`（共 1 个提交 / 6346 行增删）：
+
+| 指标 | Agent | Human |
+| --- | --- | --- |
+| 提交数 | 1 / 1（100%） | 0 / 1（0%） |
+| 增删行数 | 6346 / 6346（100%） | 0 / 6346（0%） |
+
+顶部徽章由同一份数据生成，数值与本节一致。
+
+**统计口径**（避免误读）：
+
+- 数据源是 `git log HEAD --no-merges --numstat`：累计每个提交的 **insertion + deletion 行数**，并统计提交数；merge 提交不计。
+- 归属只看提交的 **Author**（`Agent <agent@local.invalid>` 记为 Agent），**不看** `Co-authored-by`。所以只有人类自己 authored 的提交才会计入 Human —— Agent 提交即使带 `Co-authored-by: <human>` 也不会加分。
+- 只统计**已提交**内容；工作区未提交的改动不计入（当前还有未提交的 `console_windows.go` / `console_other.go` / `main.go` / 本 README 的修改）。
+- 当前仓库只有 1 个提交，所以 Human 显示 0%。这是「按行数 / 提交数」这一维度的事实，不代表需求、评审、验收与运维上的贡献。
+- 顶部徽章统计的是**当前 `HEAD` 的累计值**，会自动刷新且不会重复插入；本节表格是写该节时的快照，后续提交只会让行数变大，重跑脚本时需人工同步本表。
+
+原始数据可用下面的命令自行核对：
+
+```powershell
+git log HEAD --no-merges --numstat --format="%H%x09%an%x09%ae%x09%s"
+```
